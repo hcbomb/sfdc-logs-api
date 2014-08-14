@@ -1,0 +1,30 @@
+# creds
+######################
+*.creds*
+
+# Logs
+######################
+sfdc.api.getlogs.log*
+
+# vim stuff
+######################
+.vim*
+
+# ipython metadata
+######################
+.ipynb_checkpoints
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# other
+######################
+ThreadPool.py
+
