@@ -3,12 +3,11 @@ Salesforce API Log Collection
 
 
 USAGE: 
-\>api.app.logs.py \<file\> -write -w \<file\> [-login {rest|soap}]
-[-dest_folder \<path\>] [-org {all|\<org name\>}] [-app {all| \<org name\>}] [-days
-{1..7}] [-console]
+>api.app.logs.py \<file\> -write -w \<file\> [-login {rest|soap}]
+[-dest_folder \<path\>] [-org {all |\<org name\>}] [-app {all| \<org name\>}] [-days{1..7}] [-console]
 
 Example:
-\>**api.app.logs.py** *.creds.enc* *-days 1* -v -dest_folder /opt/logs -console
+>**api.app.logs.py** *.creds.enc* *-days 1* -v -dest_folder /opt/logs -console
 
 Format of the raw credentials file should at the minimum look like this:
 
