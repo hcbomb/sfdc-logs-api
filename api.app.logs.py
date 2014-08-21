@@ -23,7 +23,8 @@ log.setLevel(logging.DEBUG)
 fh = TimedRotatingFileHandler('sfdc.api.getlogs.log', when='d', interval=4, backupCount=14)
 fh.setLevel(logging.DEBUG)
 
-ch = logging.handlers.SysLogHandler(address=('sfm-sec-splk-hf-lp2', 518), facility=logging.handlers.SysLogHandler.LOG_NOTICE)
+ch = logging.handlers.SysLogHandler(address='/var/run/syslog', facility=logging.handlers.SysLogHandler.LOG_NOTICE)
+#ch = logging.handlers.SysLogHandler(address=('sfm-sec-splk-hf-lp2', 518), facility=logging.handlers.SysLogHandler.LOG_NOTICE)
 ch.setLevel(logging.INFO)
 
 formatter = logging.Formatter('%(asctime)s %(name)s[%(process)d]: log_level=%(levelname)s function=%(funcName)s line:%(lineno)d message="%(message)s"',
@@ -33,7 +34,7 @@ chformat = logging.Formatter('%(name)s[%(process)d]: log_level=%(levelname)s fun
 fh.setFormatter(formatter)
 ch.setFormatter(chformat)
 log.addHandler(fh)
-log.addHandler(ch)
+#log.addHandler(ch)
 
 # init syslog
 syslog = logging.getLogger('sfdc_log')
@@ -70,11 +71,20 @@ start_time = None
 cfg = ConfigParser.SafeConfigParser()
 fp = None
 
-def config_dump():
-    for s in cfg.sections():
+def config_encode(raw):
+    temp = None
+    for s in raw.sections():
+        for o in raw.options(s):
+            temp = b.b64encode(str(raw.get(s,o)))
+            raw.set(s,o,temp)
+
+def config_dump(dump=None):
+    if not dump:
+        dump=cfg
+    for s in dump.sections():
         print 'section: %s' % s
-        for o in cfg.options(s):
-            print '\t%s => %s' % (o, cfg.get(s,o))
+        for o in dump.options(s):
+            print '\t%s => %s' % (o, dump.get(s,o))
 
 # default: read file
 def check_file(file_path, write_true=False):
@@ -85,14 +95,14 @@ def check_file(file_path, write_true=False):
             log.debug('Attempting to read file %s' % file_path)
     # if file does not exist and attempting to read, error
     elif not write_true:
-        raise RuntimeError('File: %s does not exist; please validate' % file_path)
+        raise Exception('File: %s does not exist; please validate' % file_path)
 
 def validate_config(file_path, write_true=False):
     try:
         check_file(file_path, write_true)
         fp = cfg.read(file_path)
     except Exception, e:
-        log.error(e,exc_info=1)
+        log.error('Failed file check. %s' % e,exc_info=1)
         raise RuntimeError('config file %s invalid; please validate' % file_path)
   
     if not cfg.sections():
@@ -107,7 +117,7 @@ def validate_config(file_path, write_true=False):
         try:
             stype = b.b64decode(cfg.get(s,'type'))
         except:
-            log.warning('no type specified for section %s' % s)
+            log.warning('type option specified for section %s failed decode' % s)
             continue
 
         # validates option field and value specified
@@ -129,6 +139,10 @@ def validate_config(file_path, write_true=False):
             app_list[s] = {}
             if (not id_check or not secret_check):
                 log.warning('connected app settings not configured for <%s>' % s)
+    if not org_list:
+        raise Exception('Error: Failed file check; no orgs were extracted. Please validate encoded file. \
+            \n\tIf file is raw, execute with "-w <file name>" flag to generate encoded file to use.')
+        sys.exit(1)
         
 
 ### Extract Config
@@ -171,30 +185,51 @@ def extract_org(org_name, check_rest=False):
 
 
 def extract_configs(check_rest, org=None, app=None):
-    if org:
-        # all orgs is specified, extract just orgs
-        if 'all' == org:
-            for s in cfg.sections():
-                # don't forget; these are encoded
-                if (b.b64decode(cfg.get(s,'type')) == 'org'):
-                    error_str, org_temp = extract_org(s, check_rest)
-                    if error_str:
-                        log.error('cannot complete config read <%s>; terminating' % error_str)
-                        break
-                    # append only if something was returned
-                    if org_temp:
-                        org_list[s] = org_temp 
-    elif app:
-        # REST is specified, so check for connected app settings
-        if check_rest:
-            if not app:
-                raise RuntimeError('missing app name: please specify app name to check in configs for REST login')
-            elif 'all' == app:
+    try:
+        if org:
+            # all orgs is specified, extract just orgs
+            if 'all' == org:
                 for s in cfg.sections():
-                    if (b.b64decode(cfg.get(s,'type')) == 'app'):
-                        app_temp = extract_connapp(s)
-                        if app_temp:
-                            app_list[s] = app_temp
+                    # don't forget; these are encoded
+                        if (b.b64decode(cfg.get(s,'type')) == 'org'):
+                            error_str, org_temp = extract_org(s, check_rest)
+                            if error_str:
+                                log.error('cannot complete config read <%s>; skipping section' % error_str)
+                                break
+                            # append only if something was returned
+                            if org_temp:
+                                org_list[s] = org_temp 
+            # specify only one org to extract
+            else:
+                if cfg.has_section(org):
+                    # don't forget; these are encoded
+                    if (b.b64decode(cfg.get(org,'type')) == 'org'):
+                        error_str, org_temp = extract_org(org, check_rest)
+                        if error_str:
+                            log.error('cannot complete config read <%s>; terminating program' % error_str)
+                            sys.exit(1)
+                        # append only if something was returned
+                        if org_temp:
+                            org_list[org] = org_temp      
+                else:
+                    log.error('cannot locate org %s in config. please validate config' % org)
+                    sys.exit(1)     
+
+        elif app:
+            # REST is specified, so check for connected app settings
+            if check_rest:
+                if not app:
+                    raise RuntimeError('missing app name: please specify app name to check in configs for REST login')
+                elif 'all' == app:
+                    for s in cfg.sections():
+                        if (b.b64decode(cfg.get(s,'type')) == 'app'):
+                            app_temp = extract_connapp(s)
+                            if app_temp:
+                                app_list[s] = app_temp
+    except TypeError == 'Incorrect padding':
+        raise
+    except Exception:
+        raise
 
 
 ### Acquire Session ID
@@ -289,7 +324,7 @@ def run_token_setup(org_name, my_app):
     return token, instance, issued
 
 # write/update file
-def update_config(w=None):
+def write_config(dest):
 
     if verbose:
         config_dump()
@@ -298,10 +333,15 @@ def update_config(w=None):
     #pp.pprint(app_list)
     #pp.pprint(org_list)
 
-    if w:
-        wp = open(w, 'wb')
+    try:
+        wp = open(dest, 'w')
+        config_encode(cfg)
         cfg.write(wp)
         wp.close()
+
+        log.info('Success! Wrote encoded configs to file: %s; exiting' % dest)
+    except Exception, e:
+        log.error('Fail: Cannot write encoded config to file: %s. %s' % (dest, str(e)))
 
 #### Build Log Query
 
@@ -547,16 +587,15 @@ def main (argv):
     start_time = datetime.now()
     try:
         parser = argparse.ArgumentParser(description='Execute log extraction from Salesforce API',
-          epilog = 'USAGE: api.app.logs.py <file> -write -w <file> \
+          epilog = 'usage (with options): api.app.logs.py <file> -w <file> \
                     [-login {rest|soap}] [-dest_folder <path>] \
                     [-org {all|<org name>}] [-app {all| <org name>}] \
-                    [-days {1..7}] \
+                    [-days {2..86400}] \
                     [-console]')
 
         parser.add_argument('file', help='specify base config file')
-        parser.add_argument('-w', help='specify dest base config file')
+        parser.add_argument('-write', '-w', help='specify dest to write encoded config file')
 
-        parser.add_argument('-write', action='store_true', default=False, help='write config destination specified. default read from config file')
         parser.add_argument('-login', '-l', nargs='?', default='soap', help='login method')
 
         # default is current location
@@ -593,9 +632,10 @@ def main (argv):
 
         # if write, validate file
         if args.write:
-            check_file(args.w, True)
+            check_file(args.write, True)
+            write_config(dest=args.write)
+            sys.exit()
 
-            #write_config(src=args.file, dest=args.write)
         if args.login != 'rest' and args.login != 'soap':
             raise Exception('invalid login method. use rest or soap')
 
@@ -605,24 +645,27 @@ def main (argv):
 
     except Exception, e:
         log.error(repr(e),exc_info=1)
-
+    
     rest = (args.login == 'rest')
 
-    extract_configs(rest, args.org, args.app)
-
     days = int(args.days[0])
-    login = args.login
-            
-    if not (0 < days and days <= 7):
-        log.error('invalid integer <%s>. specify 1-7 days' % str(days),exc_info=1)
-        return -1
-
-    org = args.org 
+    login = args.login            
+    org = 'all' if args.org is None and args.app is None else args.org
     log.info('attempting to collect %s days of logs from %s' % (days, org))
+
+    try:
+        extract_configs(rest, org, args.app)
+    except Exception, e:
+        log.error('Failed to extract creds. %s' % repr(e))
+        exit 
+
+    if days < 2:
+        log.error('invalid integer <%s>. specify 2-8 days' % str(days),exc_info=1)
+        exit
     
     try:
         org_collect = []
-        if org == 'all':
+        if org == 'all' or org is None:
             org_collect = sorted(org_list.keys())
         else:
             org_collect.append(org)
@@ -633,7 +676,6 @@ def main (argv):
                  +'. days collect: %i' % days)
         
         run_log_init_check(orgs=org_collect, login=login)
-        update_config(args.w)
 
         run_log_collect(orgs=org_collect, login=login, days=days)
 
