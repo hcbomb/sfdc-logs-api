@@ -8,54 +8,19 @@ import re
 import sys
 import os
 import pdb
-import socket
+import ast
+import time
 import logging
-from logging.handlers import TimedRotatingFileHandler as TimedRotatingFileHandler
+import argparse
+import socket
+import signal
+from logging.handlers import TimedRotatingFileHandler
 from logging.handlers import SysLogHandler 
+from logging.handlers import SMTPHandler
 from datetime import datetime
 
 # File: 
 # Author: Henry Canivel
-
-# init loggers
-log = logging.getLogger('sfdc_log_internal')
-log.setLevel(logging.DEBUG)
-fh = TimedRotatingFileHandler('sfdc.api.getlogs.log', when='d', interval=4, backupCount=14)
-fh.setLevel(logging.DEBUG)
-
-ch = logging.handlers.SysLogHandler(address='/var/run/syslog', facility=logging.handlers.SysLogHandler.LOG_NOTICE)
-#ch = logging.handlers.SysLogHandler(address=('sfm-sec-splk-hf-lp2', 518), facility=logging.handlers.SysLogHandler.LOG_NOTICE)
-ch.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s %(name)s[%(process)d]: log_level=%(levelname)s function=%(funcName)s line:%(lineno)d message="%(message)s"',
-                              datefmt='%m/%d/%YT%H:%M:%S%z')
-chformat = logging.Formatter('%(name)s[%(process)d]: log_level=%(levelname)s function=%(funcName)s line:%(lineno)d %(message)s')
-
-fh.setFormatter(formatter)
-ch.setFormatter(chformat)
-log.addHandler(fh)
-#log.addHandler(ch)
-
-# init syslog
-syslog = logging.getLogger('sfdc_log')
-syslog.setLevel(logging.INFO)
-sh = logging.handlers.SysLogHandler(address=('sfm-sec-splk-hf-lp2', 518), facility=logging.handlers.SysLogHandler.LOG_NOTICE)
-#sh = logging.handlers.SysLogHandler(address=('localhost', 514), facility=logging.handlers.SysLogHandler.LOG_NOTICE)
-sysformat = logging.Formatter('%(name)s[%(process)d]: %(message)s')
-sh.setFormatter(sysformat)
-sh.createLock()
-syslog.addHandler(sh)
-
-# separate logger to send app logs over syslog
-
-try:
-    import argparse
-    import simple_salesforce
-    import requests
-except ImportError:
-    log.exception('Missing module <%s>; please install using: "pip install %s"'
-                  % ('simple_salesforce', 'simple_salesforce'))
-    exit
 
 pp = pprint.PrettyPrinter(indent=2)
 verbose = False
@@ -66,11 +31,152 @@ org_collect = None
 args = None
 dir_create_flag = False
 start_time = None
+r_file = None
+rlist = None
+errors = []
 
 # init cfg operations
-cfg = ConfigParser.SafeConfigParser()
+cfg = None
 fp = None
+log = None
+syslog = None
+sh = None
+base_config = {}
+base_section_list = ['base','email','syslog destination','monitor']
 
+configure_file = None
+mfg = None
+monitor_file = None
+
+# init loggers
+# separate logger to send app logs over syslog
+
+def init_libs():
+  try:
+    global simple_salesforce
+    global requests
+    import simple_salesforce
+    import requests
+  except ImportError:
+    log.exception('Missing module <%s>; please install using: "pip install %s"'
+      % ('simple_salesforce', 'simple_salesforce'))
+    sys.exit(1)
+
+# save whatever we can gracefully
+def signal_handler(signum, stack):
+  # validate base config settings before writing to the files 
+  if not ('base' in base_config and 'folder' in base_config['base'] and 'monitor' in base_config and 'file' in base_config['monitor']):
+      sys.exit(1)
+
+  log.debug('kill signal: %i' % int(signum))
+
+  if mfg and monitor_name:
+    log.debug('writing to monitor file one last time.')
+    with open(file_name, 'wb') as mfgfile:
+      mfg.write(mfgfile)
+
+  sys.exit(0)
+
+def init_handlers():
+  global log, syslog, sh
+
+  # for local file logging
+  log_header = base_config['base']['log_header']
+  log_folder = base_config['base']['folder']
+  log_name = base_config['base']['log_name']
+
+  # validate path exists
+  if log_folder and os.path.exists(log_folder):
+    file_name = os.path.join(log_folder, log_name)
+  else:
+    file_name = os.path.join(os.path.dirname(__file__), log_name)
+
+  # for email
+  email_dest = base_config['email']['email']
+  email_subj = base_config['email']['subject']
+  smtp_server = base_config['email']['smtp_server']
+
+  # for syslog
+  syslog_header = base_config['syslog destination']['syslog_header']
+  syslog_server = base_config['syslog destination']['syslog_server']
+  syslog_port = int(base_config['syslog destination']['syslog_port'])
+
+  # set up primary handlers
+  log = logging.getLogger(log_header)
+  log.setLevel(logging.DEBUG)
+
+  syslog = logging.getLogger(syslog_header)
+  syslog.setLevel(logging.INFO)
+
+  # log to file
+  try:
+    fh = TimedRotatingFileHandler(file_name, when='d', interval=4, backupCount=14)
+    fh.setLevel(logging.DEBUG)
+    fhformat = logging.Formatter('%(asctime)s %(name)s[%(process)d]: log_level=%(levelname)s function=%(funcName)s message="%(message)s"',
+     datefmt='%m/%d/%YT%H:%M:%S%z')
+    fh.setFormatter(fhformat)
+    log.addHandler(fh)
+  except Exception, e:
+    raise Exception('file handler for file %s failed. reason: %r' % (file_name, repr(e)))
+
+  # email
+  # IT SMTP servers will mask email sender as 'noreply@salesforce.com'
+  try:
+    eh = SMTPHandler(mailhost=smtp_server,
+                     fromaddr=email_dest,
+                     toaddrs=email_dest,
+                     subject=email_subj)
+    eh.setLevel(logging.ERROR)
+    log.addHandler(eh)
+  except Exception, e:
+    raise Exception('email handler for destination %s failed. reason: %r' % (email_dest, repr(e)))
+
+  # syslog
+  try:
+    sh = logging.handlers.SysLogHandler(address=(syslog_server, syslog_port), 
+                                        facility=logging.handlers.SysLogHandler.LOG_NOTICE)
+    sh.setLevel(logging.INFO)
+    sysformat = logging.Formatter('%(name)s[%(process)d]: %(message)s', datefmt='%m/%d/%YT%H:%M:%S%z')
+    sh.setFormatter(sysformat)
+    sh.createLock()
+    syslog.addHandler(sh)
+  except Exception, e:
+    raise Exception('syslog handler for type %s failed. reason: %r' % (syslog_header, repr(e)))
+
+
+# validate settings file
+def init_settings(cfg_filename):
+  global cfg, mfg
+  try:
+    cfg = ConfigParser.SafeConfigParser()
+    cp = cfg.read(cfg_filename)
+
+    mfg = ConfigParser.SafeConfigParser()
+
+    # if cp empty, failed read
+    if not cp:
+      raise Exception('Cannot read config file %s' % cfg_filename)
+
+    # validate the sections we need
+    for i in base_section_list:
+      if i not in cfg.sections():
+        print 'section %s not found in settings?!' % i
+        raise
+      if not cfg.options(i):
+        print 'section %s has no options?!' % i
+        raise
+
+      # add values
+      base_config[i] = {}
+      for j in cfg.options(i):
+        base_config[i][j] = cfg.get(i,j)
+    
+    init_handlers()
+  except Exception, e:
+    print 'ERROR: read failed: %r' % repr(e)
+
+
+'''quickly encode raw configs'''
 def config_encode(raw):
     temp = None
     for s in raw.sections():
@@ -78,6 +184,7 @@ def config_encode(raw):
             temp = b.b64encode(str(raw.get(s,o)))
             raw.set(s,o,temp)
 
+'''function for debugging'''
 def config_dump(dump=None):
     if not dump:
         dump=cfg
@@ -86,7 +193,7 @@ def config_dump(dump=None):
         for o in dump.options(s):
             print '\t%s => %s' % (o, dump.get(s,o))
 
-# default: read file
+''' validate file exists'''
 def check_file(file_path, write_true=False):
     if os.path.exists(file_path):
         if write_true:
@@ -97,28 +204,61 @@ def check_file(file_path, write_true=False):
     elif not write_true:
         raise Exception('File: %s does not exist; please validate' % file_path)
 
-def validate_config(file_path, write_true=False):
+''' validates if we can write to recovery file. 
+    there are 3 scenarios to consider:
+    1. partial list of logs were successfully completed (collect what's left) from same org
+    2. some orgs were successful, some weren't
+        how to determine to collect from just what failed
+    3. cache last successful timestamp per org to baseline
+'''
+def check_recovery_file(file_path):
     try:
-        check_file(file_path, write_true)
-        fp = cfg.read(file_path)
+        if os.path.exist(file_path):
+            log.info('recovery file %s is non-empty, validating')
+            rlist = {}
+            with open(file_path, 'r') as f:
+                temp = {}
+                rorg, rtime, rstate, rpayload = f.readline()
+                temp['time'] = int(rtime)
+                temp['state'] = str(rstate)
+                temp['entries'] = ast.literal_eval(rpayload)
+                rlist[org] = dict(temp)
+    except:
+        log.exception('Failure reading from file %s' % file_path)
+
+''' don't want to read raw configs and process logs. this enforces file to at least fail 
+    any practice of automating from plaintext credential files.
+    validates proper creds for org is provided
+
+    reading password configs
+'''
+def validate_config(creds_file, write_true=False):
+    
+    try:
+        check_file(creds_file, write_true)
+        fp = cfg.read(creds_file)
     except Exception, e:
         log.error('Failed file check. %s' % e,exc_info=1)
-        raise RuntimeError('config file %s invalid; please validate' % file_path)
-  
+        raise RuntimeError('config file %s invalid; please validate' % creds_file)
+
     if not cfg.sections():
         log.error('No sections to defined in config file %s' % file_path,exc_info=1)
+        raise RuntimeError('config file %s invalid; please validate' % creds_file)
+
     for s in cfg.sections():
         user_check = False
         pass_check = False
         id_check = False
         secret_check = False
         stype = None
-        
-        try:
-            stype = b.b64decode(cfg.get(s,'type'))
-        except:
-            log.warning('type option specified for section %s failed decode' % s)
+  
+        log.debug('processing config section %s' % s)      
+        if not cfg.has_option(s, 'type'):
             continue
+        else:
+            log.debug('Section: %s has type option specified. Proceed to decode user/pass' % s)
+
+        stype = b.b64decode(cfg.get(s,'type'))
 
         # validates option field and value specified
         for o in cfg.options(s):
@@ -183,37 +323,23 @@ def extract_org(org_name, check_rest=False):
         
     return status, org
 
-
-def extract_configs(check_rest, org=None, app=None):
+''' validate proper options are provided for appropriate login type'''
+def extract_configs(check_rest=False, org=None, app=None):
     try:
         if org:
-            # all orgs is specified, extract just orgs
-            if 'all' == org:
-                for s in cfg.sections():
-                    # don't forget; these are encoded
-                        if (b.b64decode(cfg.get(s,'type')) == 'org'):
-                            error_str, org_temp = extract_org(s, check_rest)
-                            if error_str:
-                                log.error('cannot complete config read <%s>; skipping section' % error_str)
-                                break
-                            # append only if something was returned
-                            if org_temp:
-                                org_list[s] = org_temp 
-            # specify only one org to extract
+            if cfg.has_section(org):
+                # don't forget; these are encoded
+                if (b.b64decode(cfg.get(org,'type')) == 'org'):
+                    error_str, org_temp = extract_org(org, check_rest)
+                    if error_str:
+                        log.error('cannot complete config read <%s>; terminating program' % error_str)
+                        sys.exit(1)
+                    # append only if something was returned
+                    if org_temp:
+                        org_list[org] = org_temp      
             else:
-                if cfg.has_section(org):
-                    # don't forget; these are encoded
-                    if (b.b64decode(cfg.get(org,'type')) == 'org'):
-                        error_str, org_temp = extract_org(org, check_rest)
-                        if error_str:
-                            log.error('cannot complete config read <%s>; terminating program' % error_str)
-                            sys.exit(1)
-                        # append only if something was returned
-                        if org_temp:
-                            org_list[org] = org_temp      
-                else:
-                    log.error('cannot locate org %s in config. please validate config' % org)
-                    sys.exit(1)     
+                log.error('cannot locate org %s in config. please validate config' % org)
+                sys.exit(1)     
 
         elif app:
             # REST is specified, so check for connected app settings
@@ -236,15 +362,57 @@ def extract_configs(check_rest, org=None, app=None):
 
 def sessionid_login(org_name, username, password, orgid, sandbox=False):
     session_id, sf_instance = None, None
+
+    retry = 0
     try:
-        session_id, sf_instance = simple_salesforce.SalesforceLogin(username=username,
-                                                                    password=password,
-                                                                    organizationId=orgid, 
-                                                                    sandbox=sandbox, 
-                                                                    sf_version='31.0')
+        threshold = int(base_config['monitor']['retry_threshold'])
+        timeout = int(base_config['monitor']['timeout'])
     except Exception, e:
-        log.error(repr(e) + ': failed SOAP login for org %s' % org_name, exc_info=1)
-    issued=datetime.now().strftime('%s') if session_id else None
+        log.error(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
+        raise
+
+    while retry < threshold:
+        try:
+            session_id, sf_instance = simple_salesforce.SalesforceLogin(username=username,
+                                                                        password=password,
+                                                                        organizationId=orgid, 
+                                                                        sandbox=sandbox, 
+                                                                        sf_version='31.0')
+            # if we get valid results, break out of loop
+            if session_id and sf_instance:
+                break
+        except simple_salesforce.SalesforceAuthenticationFailed, e:
+
+            error_str = str(e)
+
+            # retry only if timeout error (404)
+
+            if '404' not in error_str:
+                log.error(error_str + ': failed SOAP login for org %s; terminating' % org_name, exc_info=1)
+                session_id, sf_instance = None, None
+                break
+
+            # timeout error, org may be down; increment counter wait
+            log.error('%s: failed SOAP login for org %s. timeout caught; retry attempt: %i/%i. sleep: %is' 
+                % (error_str, org_name, retry, threshold, timeout))
+
+            retry += 1
+
+            sleep(timeout)
+            # incr timeout
+            timeout += timeout
+
+        except Exception, e:
+            log.error(error_str + ': failed SOAP login for org %s' % org_name, exc_info=1)
+            break
+
+    if session_id:
+        issued = datetime.now().strftime('%s')  
+    else:
+        issued = None
+        session_id = None
+        sf_instance = None
+        log.error('Reached max threshold (%s) for org: %s' % (str(threshold), org_name))
     return session_id, sf_instance, issued
 
 
@@ -330,9 +498,6 @@ def write_config(dest):
         config_dump()
         pass
 
-    #pp.pprint(app_list)
-    #pp.pprint(org_list)
-
     try:
         wp = open(dest, 'w')
         config_encode(cfg)
@@ -355,7 +520,7 @@ if (testing):
     version = '31.0'
     last_days = 100
     
-
+# build SOQL query for use
 def get_query(instance, days):
     #https://${instance}.salesforce.com/services/data/v31.0/query?q=Select+Id+,+EventType+,+LogDate+From+EventLogFile+Where+LogDate+=+${day}
 
@@ -367,18 +532,6 @@ def get_query(instance, days):
     params = {'q': query}
     
     return base_url, params
-
-def run_query():
-    #https://${instance}.salesforce.com/services/data/v31.0/query?q=Select+Id+,+EventType+,+LogDate+From+EventLogFile+Where+LogDate+=+${day}
-
-    #query = 'Select+Id+,+EventType+,+LogDate+From+EventLogFile+Where+LogDate+=+Last_n_Days:{last_days}'
-    query = 'Select Id , EventType , LogDate From EventLogFile Where LogDate = Last_n_Days:{last_days}'
-    query = query.format(last_days = last_days)
-    base_url = '{instance}/services/data/v{version}/query'
-    base_url = base_url.format(instance = instance, version = version, query = query)
-    params = {'q': query}
-
-    print 'base_url:\t%s\nparams:\t%s' % (base_url, params)
 
 # 
 def clean_up_creds_cfg(section):
@@ -394,44 +547,43 @@ def clean_up_creds_cfg(section):
     if cfg.has_option(section, 'issued'):
         cfg.remove_option(section, 'issued')
 
-def run_log_init_check(orgs, login):
+def configure_session_auth(org_name, login):
     check_time = int(datetime.now().strftime('%s'))
     
-    for org_name in orgs:
-        org = org_list[org_name]
-        try:
-            # if the current session id is invalid or expired (> 24h), update
-            if 'issued' not in org or (check_time - int(org['issued'])) >= 86400:
-                if login == 'soap':
-                    session_id, sf_instance, issued = run_sessionid_setup(org_name, org)
+    org = org_list[org_name]
+    # if the current session id is invalid or expired (> 24h), update
+    if 'issued' not in org or (check_time - int(org['issued'])) >= 86400:
+        if login == 'soap':
 
-                    # wasn't able to pull new session id, expired anyways, so remove from config                
-                    if not session_id:
-                        clean_up_creds_cfg(section=org_name)
-                        continue
-                    org_list[org_name]['sessionid'] = b.b64encode(str(session_id))
-                    cfg.set(org_name, 'sessionid', org_list[org_name]['sessionid'])
+            # error handling for getting the sessionid is run at the libracy call
+            session_id, sf_instance, issued = run_sessionid_setup(org_name, org)
 
-                elif login == 'rest':
-                    token, sf_instance, issued = run_token_setup(org_name, org)
-                    org_list[org_name]['token'] = b.b64encode(str(token))
-                    cfg.set(org_name, 'token', org_list[org_name]['token'])
+            # wasn't able to pull new session id, expired anyways, so remove from config                
+            if not session_id:
+                clean_up_creds_cfg(section=org_name)
+                #continue
+            org_list[org_name]['sessionid'] = b.b64encode(str(session_id))
+            cfg.set(org_name, 'sessionid', org_list[org_name]['sessionid'])
 
-                if not sf_instance or not issued:
-                    log.error('how did you get this far?? should\'ve been skipped')
-                    continue
+        elif login == 'rest':
+            token, sf_instance, issued = run_token_setup(org_name, org)
+            org_list[org_name]['token'] = b.b64encode(str(token))
+            cfg.set(org_name, 'token', org_list[org_name]['token'])
 
-                org_list[org_name]['sf_instance'] = str(sf_instance)
-                org_list[org_name]['issued'] = str(issued)
+        if not sf_instance or not issued:
+            log.error('how did you get this far?? should\'ve been skipped')
+            #continue
 
-                cfg.set(org_name, 'sf_instance', org_list[org_name]['sf_instance'])
-                cfg.set(org_name, 'issued', org_list[org_name]['issued'])
+        org_list[org_name]['sf_instance'] = str(sf_instance)
+        org_list[org_name]['issued'] = str(issued)
 
-        # don't crash program if only one org fails
-        except Exception, e:
-            log.error(repr(e) +': init failed for org %s' % org_name, exc_info=1)
+        cfg.set(org_name, 'sf_instance', org_list[org_name]['sf_instance'])
+        cfg.set(org_name, 'issued', org_list[org_name]['issued'])
 
 
+'''validates sessionid/token within 24
+    caveat: timeout/ttl for sessionid/token depends on org. may need to update.
+'''
 def pass_org_check(org_name):
     org = org_list[org_name]
 
@@ -461,6 +613,7 @@ def check_dir(dir_path):
         # flags for newly created. if there's an error, remove
         dir_create_flag = True
 
+'''metadata to collect and save eventlogs'''
 def build_record_info(org_name, record):
     
     if record['attributes']['type'] != 'EventLogFile':
@@ -484,7 +637,7 @@ def build_record_info(org_name, record):
 
     return r
 
-# dry run of configs to build the file
+''' dry run of configs to build the file '''
 def print_results(result):
     records = result['records']
 
@@ -494,37 +647,142 @@ def print_results(result):
         log_list.append(x)
         print x
 
-# overwrite existing files; in case need to replace
-def download_file(record, header):
+''' overwrite existing files; in case need to replace 
+    error handling (for the get request):
+        expired sessionid
+        timeout (to service or query taking too long)
+
+    else:
+        mark/log for missed
+        # future: process
+'''
+def process_record(org_name, record, header):
+    global errors
     dest_filename = args.dest_folder +'/' +record['file_path']
     base_url = record['base_url'] +record['url']
 
     timer_start = datetime.now()
-    req= requests.get(base_url, headers=header, stream=True)
+
+    try:
+        threshold = int(base_config['monitor']['retry_threshold'])
+        timeout = int(base_config['monitor']['timeout'])
+    except Exception, e:
+        log.error(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
+
+    retry = 0
+    while retry < threshold:
+        try:
+            req= requests.get(base_url, headers=header, stream=True)
+
+            if req.ok:
+                break
+
+            else:
+                bad = qres.json()[0]
+                #raise RuntimeError(': '.join("%s=%r" % (str(k), str(v)) for k,v in bad.items())) 
+
+                errorCode = str(bad['errorCode'])
+                message = str(bad['message'])
+
+                # get new session id and retry
+                if 'INVALID_SESSION_ID' in errorCode:
+                    # session expired; init header/get sessionid
+                    log.error('%s => %s: error retrieving log file. org: %s log_type: %s id: %s reason: sessionid expired; retry attempt: %i/%i. resetting retry.'
+                        % (errorCode, message, org_name, record['type'], record['id'], retry, threshold))
+
+                    configure_session_auth(org_name=org_name, login=login)
+
+                    # build header info
+                    url, header, params = build_header_info(org_name=org_name)
+
+                    retry = 0
+
+                elif 'QUERY_TIMEOUT' in errorCode:
+                    # timeout error, org may be down; increment counter wait
+                    log.error('%s => %s: error retrieving log file. org: %s log_type: %s id: %s reason: timeout caught; retry attempt: %i/%i. sleep: %is'
+                        % (errorCode, message, org_name, record['type'], record['id'], retry, threshold, timeout))
+
+                    retry += 1
+
+                    sleep(timeout)
+                    # incr timeout
+                    timeout += timeout
+
+                # other
+                else:
+                    error_str = '%s => %s: error retrieving log file. org: %s. something bad happened; retry attempt: %i/%i. stopping collection for this file.' \
+                        % (errorCode, message, org_name, retry, threshold, timeout)
+                    log.exception(error_str)
+                    return [error_str]
+
+
+        except (requests.ConnectionError, requests.HTTPError), e:
+            log.error(repr(e) +': cannot extract Org API CSV log. org: %s\tlog_type: %s' 
+                % (org_name, record['type']), exc_info=1)
+
+            retry += 1
     
+    # if unsuccessful, 
+    if not req.ok:
+        error_str = 'error retrieving log file. org: %s log_type: %s id: %s reason: %r' \
+            % (org_name, record['type'], record['id'], repr(req.reason))
+        log.error(error_str)
+        return [error_str]
+
     # make sure destination folder is legit
     check_dir(os.path.dirname(dest_filename))
 
     if os.path.isfile(dest_filename):
         log.warning('Warning: file %s already exists; overwriting' % dest_filename)
         
-    if not req.ok:
-        print 'Ouch. something went wrong with: %r' % record
-        return False
-    
-    try:
-        with open(dest_filename, 'wb') as f:
-    #        for chunk in r.iter_content(chunk_size=1024):
-            for line in req.iter_lines(chunk_size=2048):
-                if line:
+    with open(dest_filename, 'wb') as f:
+        # for chunk in req.iter_content(chunk_size=2024):
+        for line in req.iter_lines(chunk_size=2048):
+            if line:
+                try:    # for thread synchronization
+                    sh.acquire()
+                    line = line.replace("'", "")                    
+
                     try:
-                        sh.acquire()
-                        # write to local log file and send to syslog
-                        syslog.info('log=%s %r' % (record['type'], line))
-                        f.write(line)
-                        f.flush()
+                        # send out to log collector
+                        syslog.info('%r\n' % (line))
+                    except Exception, e:
+                        errors.append('error sending log via syslog. org: %s log_type: %s: id: %s reason: %r' 
+                            % (org_name, record['type'], record['id'], repr(e)))
+                    try:
+                        f.write(line +'\n')
+                    except Exception, e:
+                        errors.append('error writing log locally. org: %s log_type: %s: id: %s reason: %r' 
+                            % (org_name, record['type'], record['id'], repr(e)))
                     finally:
-                        sh.release()
+                        f.flush()
+                finally:
+                    sh.release()
+
+    timer_finish = datetime.now()
+    d = timer_finish - timer_start
+    log.info("Saved to: %s. duration=%s.%s sec" % (dest_filename, d.seconds, d.microseconds))
+
+    # return condensed list if any
+    return set(errors)
+
+''' send files over syslog 
+    #unused
+'''
+def syslog_file(record):
+    dest_filename = args.dest_folder +'/' +record['file_path']
+    
+    timer_start = datetime.now()
+    try:
+        with open(dest_filename, 'r') as f:
+            for line in f.readline():
+                try:
+                    sh.acquire()
+                    line = line.replace("'", "")                    
+                    # write to local log file and send to syslog
+                    syslog.info('%r' % line)
+                finally:
+                    sh.release()
     except Exception, e:
         log.error(str(e))
         raise
@@ -533,53 +791,159 @@ def download_file(record, header):
         d = timer_finish - timer_start
         log.info("Saved to: %s. duration=%s.%s sec" % (dest_filename, d.seconds, d.microseconds))
 
+# build header info to make API calls
+def build_header_info(org_name, login, days):
+    url, header, params = None, None, None
 
+    if not pass_org_check(org_name):
+        log.info("org: %s didn't pass check" % org_name)
+        return url, header, params
+
+    org = org_list[org_name]
+
+    # get header
+    header_key = org['sessionid'] if login == 'soap' else org['token']
+
+    # remember to decode header key
+    header_key = b.b64decode(header_key)
+    header = get_header(header_key)
+
+    # get config info
+    url, params = get_query(org['sf_instance'], days)
+
+    log.debug('org: %s\turl: %s\tparams: %r' % (org_name, url, params))
+
+    return url, header, params
+
+'''
 # orgs => list of at least 1 org
 # login => method of login: REST or SOAP
 # days => # of days back to collect logs
-def run_log_collect(orgs, login, days):
-    for org_name in orgs:
-        timer_start = datetime.now()
-        org = org_list[org_name]
 
-        if not pass_org_check(org_name):
-            continue
+error handling:
+    expired sessionid
+    timeout (to service or query taking too long)
 
-        # get header
-        header_key = org['sessionid'] if login == 'soap' else org['token']
+else:
+    return / skip log collection against org
 
-        # remember to decode header key
-        header_key = b.b64decode(header_key)
-        header = get_header(header_key)
-        url, params = get_query(org['sf_instance'], days)
+changing format: 
+old: all sessionids then all logs
+new: sessionid then logs per org
+'''
+def run_log_collect(org_name, login, days):
+    timer_start = datetime.now()
 
-        log.debug('url: %s\tparams: %r' % (url, params))
-        
+    # init header/get sessionid
+    configure_session_auth(org_name=org_name, login=login)
+
+    # build header info
+    url, header, params = build_header_info(org_name=org_name, login=login, days=days)
+
+    retry = 0
+    result = None
+    try:
+        threshold = int(base_config['monitor']['retry_threshold'])
+        timeout = int(base_config['monitor']['timeout'])
+    except Exception, e:
+        log.exception(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
+        return
+
+    ''' query for last X days of event logs '''
+
+    ''' Error handling:
+        INVALID_SESSION_ID
+            action: get new sessionid
+        QUERY_TIMEOUT
+            action: wait and retry
+        else
+            action: stop log collection process for org
+    '''
+    while retry < threshold:
         qres = requests.get(url, headers=header, params=params)
+            
+        ''' sample error:
+            RuntimeError: errorCode='INVALID_SESSION_ID': message='Session expired or invalid'
+        '''
+
+        try:
+            if not qres.ok:
+                bad = qres.json()[0]
+                #raise RuntimeError(': '.join("%s=%r" % (str(k), str(v)) for k,v in bad.items())) 
+
+                errorCode = str(bad['errorCode'])
+                message = str(bad['message'])
+
+                # get new session id and retry
+                if 'INVALID_SESSION_ID' in errorCode:
+                    # init header/get sessionid
+                    log.error('%s => %s: exec SOQL query for org %s. sessionid expired; retry attempt: %i/%i. resetting retry.'
+                        % (errorCode, message, org_name, retry, threshold))
+
+                    configure_session_auth(org_name=org_name, login=login)
+
+                    # build header info
+                    url, header, params = build_header_info(org_name=org_name)
+
+                    retry = 0
+
+                elif 'QUERY_TIMEOUT' in errorCode:
+                    # timeout error, org may be down; increment counter wait
+                    log.error('%s => %s: exec SOQL query for org %s. timeout caught; retry attempt: %i/%i. sleep: %is'
+                        % (errorCode, message, org_name, retry, threshold, timeout))
+
+                    retry += 1
+
+                    sleep(timeout)
+                    # incr timeout
+                    timeout += timeout
+
+                # other
+                else:
+                    log.exception('%s => %s: exec SOQL query for org %s. something bad happened; retry attempt: %i/%i. sleep: %is'
+                        % (errorCode, message, org_name, retry, threshold, timeout))
+                    return
+
+            # SOQL exec successful
+            elif qres.ok:
+                result = qres.json()
+                log.debug('%s => exec SOQL query for org %s. status: %s, total records: %s. retry attempt: %i/%i. sleep: %is. #success!'
+                    % (str(qres.status_code), org_name, str(result['done']), str(result['totalSize']), retry, threshold, timeout))
+                break
+        except Exception, e:
+            log.exception('%s => %r: exec SOQL query for org %s. something bad happened; retry attempt: %i/%i.'
+                        % (str(qres.status_code), repr(e), org_name, retry, threshold))
+            return
+
+
+    if result['totalSize'] < 1:
+        log.warning('No entries to pull for org: %s' %org_name)
         
-        if qres.status_code > 200:
-            log.error('Request failed: ' +qres.reason)
-            
-        result = qres.json()
-        if not qres.ok:
-            bad = qres.json()[0]
-            raise RuntimeError(': '.join("%s=%r" % (str(k), str(v)) for k,v in bad.items())) 
-        if result['totalSize'] < 1:
-            log.warning('No entries to pull for org: %s' %org_name)
-            
-        records = result['records']
-        log.debug('ALL RECORDS: %r' % records)
+    records = result['records']
+    log.debug('ALL RECORDS: (count: %i) %r' % (len(records), records))
 
-        log_list = []
-        for r in records:
-            x = build_record_info(org_name, r)
-            log.debug('Record: %r\trecord info: %r' % (r,x))
-            log_list.append(x)
-            download_file(x, header)
+    '''extract logs from org'''
+    log_list = []
+    for r in records:
+        x = build_record_info(org_name, r)
+        log.debug('Record: %r\trecord info: %r' % (r,x))
+        log_list.append(x)
 
-        timer_finish = datetime.now()
-        d = timer_finish - timer_start
-        log.info("Org: %s record_count=%d duration=%s.%s sec" % (org_name, len(records), d.seconds, d.microseconds))
+    # check monitor file
+    errors = []
+    for record in log_list:
+        # process the record and returns set of error strings
+        errors += process_record(org_name, record, header)
+
+    errors = set(errors)
+
+    # shoot a summary email of errors for this org
+    if errors:
+        log.error('Summary:\n\tErrors found for org: %s\n' % org_name + '\n'.join(map(str, errors)))
+
+    timer_finish = datetime.now()
+    d = timer_finish - timer_start
+    log.info("Org: %s record_count=%d duration=%s.%s sec" % (org_name, len(records), d.seconds, d.microseconds))
 
 def main (argv):
     global args, start_time
@@ -587,14 +951,17 @@ def main (argv):
     start_time = datetime.now()
     try:
         parser = argparse.ArgumentParser(description='Execute log extraction from Salesforce API',
-          epilog = 'usage (with options): api.app.logs.py <file> -w <file> \
+          epilog = 'usage (with options): api.app.logs.py <settings file> -creds <file> -w <file> \
+                    -recovery <file> \
                     [-login {rest|soap}] [-dest_folder <path>] \
                     [-org {all|<org name>}] [-app {all| <org name>}] \
                     [-days {2..86400}] \
                     [-console]')
 
         parser.add_argument('file', help='specify base config file')
-        parser.add_argument('-write', '-w', help='specify dest to write encoded config file')
+        parser.add_argument('-creds', required=True, help='specify credentials file')
+        parser.add_argument('-write', '-w', default=False, help='specify dest to write encoded config file')
+        parser.add_argument('-recovery', '-r', help='specify dest to write file to save in case of failure')
 
         parser.add_argument('-login', '-l', nargs='?', default='soap', help='login method')
 
@@ -604,7 +971,7 @@ def main (argv):
         parser.add_argument('-org', '-o', nargs='?', default='all', help='org name')
         parser.add_argument('-app', '-a', nargs='?', default=None, help='app name')
 
-        parser.add_argument('-days', nargs=1, required=True, default=1, help='days of logs')
+        parser.add_argument('-days', nargs=1, default=None, help='days of logs')
         
         
         parser.add_argument('-console', action='store_true', default=False)
@@ -618,13 +985,31 @@ def main (argv):
         raise
         sys.exit(2)
 
-    log.debug('Initiating program at: %s' % start_time.strftime('%m/%d/%Y %H:%M:%S.%f'))
-    
-    # validate config
-    validate_config(args.file, False)
+    # init logging settings
+    init_settings(args.file)
 
+    # init lib dependencies
+    init_libs()
+
+    # validate settings and creds files
+    try:
+      validate_config(args.creds, args.write)
+    except Exception, e:
+      log.error('errors: %r' % repr(e))
+
+    log.debug('Initiating program at: %s' % start_time.strftime('%m/%d/%Y %H:%M:%S.%f'))
+
+    signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # signal cannot be caught
+    #signal.signal(signal.SIGTERM, signal_term_handler)
+    
     try:
         if args.console:
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
             log.addHandler(ch)
 
         if args.v:
@@ -635,6 +1020,13 @@ def main (argv):
             check_file(args.write, True)
             write_config(dest=args.write)
             sys.exit()
+        # if write not specified, days is mandatory
+        elif args.days == None:
+            log.error('days field mandatory if not writing a new encoded file')
+            sys.exit()
+
+        if args.recovery:
+            check_recovery_file(args.recovery)
 
         if args.login != 'rest' and args.login != 'soap':
             raise Exception('invalid login method. use rest or soap')
@@ -651,16 +1043,48 @@ def main (argv):
     days = int(args.days[0])
     login = args.login            
     org = 'all' if args.org is None and args.app is None else args.org
-    log.info('attempting to collect %s days of logs from %s' % (days, org))
-
+    
     try:
-        extract_configs(rest, org, args.app)
+        # hard coding for org (not app) access for now
+        log.info('attempting to collect %s days of logs from %s' % (days, org))
+        # all orgs is specified, extract just orgs
+        if 'all' == org:
+            for s in cfg.sections():
+                # don't forget; these are encoded
+                if cfg.has_option(s, 'type') and b.b64decode(cfg.get(s,'type')) == 'org':
+                    error_str, org_temp = extract_org(s, rest)
+                    if error_str:
+                        log.error('cannot complete config read <%s>; skipping section' % error_str)
+                        break
+                    # append only if something was returned
+                    if org_temp:
+                        org_list[s] = org_temp 
+                        extract_configs(rest, s, args.app)
+        # specify only one org to extract from
+        else:
+            try:
+                if org not in cfg.sections():
+                    log.error('org %s not configured' % org)
+                    raise
+            except:
+                pass
+            # don't forget; these are encoded
+            if (b.b64decode(cfg.get(org,'type')) == 'org'):
+                error_str, org_temp = extract_org(org, check_rest)
+                if error_str:
+                    log.error('cannot complete config read <%s>; skipping section' % error_str)
+                    raise
+                # append only if something was returned
+                if org_temp:
+                    org_list[org] = org_temp 
+                    extract_configs(rest, org, args.app)
+
     except Exception, e:
         log.error('Failed to extract creds. %s' % repr(e))
         exit 
 
     if days < 2:
-        log.error('invalid integer <%s>. specify 2-8 days' % str(days),exc_info=1)
+        log.error('invalid integer <%s>. specify 2-8 days due to data sync for logs.' % str(days),exc_info=1)
         exit
     
     try:
@@ -675,9 +1099,8 @@ def main (argv):
                  + '. method: %s' % login
                  +'. days collect: %i' % days)
         
-        run_log_init_check(orgs=org_collect, login=login)
-
-        run_log_collect(orgs=org_collect, login=login, days=days)
+        for o in org_collect:            
+            run_log_collect(org_name=o, login=login, days=days)
 
     except Exception, e:
         log.error(repr(e),exc_info=1)
@@ -693,7 +1116,14 @@ def main (argv):
         log.debug('Finalizing program at: %s\tTotal duration: %s.%s sec' 
             % (final_time.strftime('%m/%d/%Y %H:%M:%S.%f'), delta.seconds, delta.microseconds))
 
+ 
 if __name__ == "__main__":
-  main(sys.argv)
+  try:
+    main(sys.argv)
+  except KeyboardInterrupt:
+    print "testing quit"
+    log.debug( "testing quit: %r" % repr(cfg))
+    # save monitor stuff first 
+    sys.exit()
 
 
