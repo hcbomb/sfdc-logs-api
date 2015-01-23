@@ -46,6 +46,7 @@ base_section_list = ['base','email','syslog destination','monitor']
 
 mfg = None
 monitor_file = None
+config_file = None
 
 # init loggers
 # separate logger to send app logs over syslog
@@ -71,13 +72,13 @@ def signal_handler(signum, stack):
 
   if mfg and monitor_file:
     log.debug('writing to monitor file one last time.')
-    with open(file_name, 'wb') as mfgfile:
+    with open(config_file, 'wb') as mfgfile:
       mfg.write(mfgfile)
 
   sys.exit(0)
 
 def init_handlers():
-  global log, syslog, sh
+  global log, syslog, sh, config_file
 
   # for local file logging
   log_header = base_config['base']['log_header']
@@ -86,9 +87,9 @@ def init_handlers():
 
   # validate path exists
   if log_folder and os.path.exists(log_folder):
-    file_name = os.path.join(log_folder, log_name)
+    config_file = os.path.join(log_folder, log_name)
   else:
-    file_name = os.path.join(os.path.dirname(__file__), log_name)
+    config_file = os.path.join(os.path.dirname(__file__), log_name)
 
   # for email
   email_dest = base_config['email']['email']
@@ -109,14 +110,14 @@ def init_handlers():
 
   # log to file
   try:
-    fh = TimedRotatingFileHandler(file_name, when='d', interval=4, backupCount=14)
+    fh = TimedRotatingFileHandler(config_file, when='d', interval=4, backupCount=14)
     fh.setLevel(logging.DEBUG)
     fhformat = logging.Formatter('%(asctime)s %(name)s[%(process)d]: log_level=%(levelname)s function=%(funcName)s message="%(message)s"',
      datefmt='%m/%d/%YT%H:%M:%S%z')
     fh.setFormatter(fhformat)
     log.addHandler(fh)
   except Exception, e:
-    raise Exception('file handler for file %s failed. reason: %r' % (file_name, repr(e)))
+    raise Exception('file handler for file %s failed. reason: %r' % (config_file, repr(e)))
 
   # email
   # IT SMTP servers will mask email sender as 'noreply@salesforce.com'
@@ -367,7 +368,7 @@ def sessionid_login(org_name, username, password, orgid, sandbox=False):
     try:
         threshold = int(base_config['monitor']['retry_threshold'])
         timeout = int(base_config['monitor']['timeout'])
-        monitor_file = int(base_config['monitor']['file'])
+        monitor_file = str(base_config['monitor']['file'])
     except Exception, e:  
         log.error(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
         raise
@@ -1117,6 +1118,7 @@ def main (argv):
         
         for o in org_collect:            
             run_log_collect(org_name=o, login=login, days=days)
+            final_time = datetime.now()
 
             time_org = final_time.strftime('%m/%d/%Y %H:%M:%S.%f')
             mfg.set(s, 'last_run', time_org)
@@ -1147,3 +1149,4 @@ if __name__ == "__main__":
     sys.exit()
 
 
+`
