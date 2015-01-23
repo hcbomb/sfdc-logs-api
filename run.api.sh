@@ -7,7 +7,7 @@
 # max: 7 default: 2
 days=2
 
-if [ "$1" -ge 1 -a "$1" -le 9 ]; then
+if [ "$1" -ge 1 ]; then
   days=$1
 fi
 
