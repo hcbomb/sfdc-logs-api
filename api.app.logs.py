@@ -44,7 +44,6 @@ sh = None
 base_config = {}
 base_section_list = ['base','email','syslog destination','monitor']
 
-configure_file = None
 mfg = None
 monitor_file = None
 
@@ -70,7 +69,7 @@ def signal_handler(signum, stack):
 
   log.debug('kill signal: %i' % int(signum))
 
-  if mfg and monitor_name:
+  if mfg and monitor_file:
     log.debug('writing to monitor file one last time.')
     with open(file_name, 'wb') as mfgfile:
       mfg.write(mfgfile)
@@ -214,7 +213,7 @@ def check_file(file_path, write_true=False):
 def check_recovery_file(file_path):
     try:
         if os.path.exist(file_path):
-            log.info('recovery file %s is non-empty, validating')
+            log.debug('recovery file %s is non-empty, validating')
             rlist = {}
             with open(file_path, 'r') as f:
                 temp = {}
@@ -361,13 +360,15 @@ def extract_configs(check_rest=False, org=None, app=None):
 ### Acquire Session ID
 
 def sessionid_login(org_name, username, password, orgid, sandbox=False):
+    global monitor_file
     session_id, sf_instance = None, None
 
     retry = 0
     try:
         threshold = int(base_config['monitor']['retry_threshold'])
         timeout = int(base_config['monitor']['timeout'])
-    except Exception, e:
+        monitor_file = int(base_config['monitor']['file'])
+    except Exception, e:  
         log.error(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
         raise
 
@@ -408,6 +409,11 @@ def sessionid_login(org_name, username, password, orgid, sandbox=False):
 
     if session_id:
         issued = datetime.now().strftime('%s')  
+        # update monitor cfg
+        try:
+          mfg.add_section(org_name)
+        except Exception, e:
+          log.error('cannot update mfg with new org: %s' % org_name)
     else:
         issued = None
         session_id = None
@@ -726,7 +732,7 @@ def process_record(org_name, record, header):
     if not req.ok:
         error_str = 'error retrieving log file. org: %s log_type: %s id: %s reason: %r' \
             % (org_name, record['type'], record['id'], repr(req.reason))
-        log.error(error_str)
+        #log.error(error_str)
         return [error_str]
 
     # make sure destination folder is legit
@@ -813,6 +819,8 @@ def build_header_info(org_name, login, days):
 
     log.debug('org: %s\turl: %s\tparams: %r' % (org_name, url, params))
 
+    mfg.set(org_name, 'status', 'building header info')
+
     return url, header, params
 
 '''
@@ -844,7 +852,7 @@ def run_log_collect(org_name, login, days):
     result = None
     try:
         threshold = int(base_config['monitor']['retry_threshold'])
-        timeout = int(base_config['monitor']['timeout'])
+        timeout = int(base_config['monitor']['timeout'])        
     except Exception, e:
         log.exception(repr(e) +': cannot extract monitor parameters to process org %s' % org_name, exc_info=1)
         return
@@ -861,6 +869,7 @@ def run_log_collect(org_name, login, days):
     '''
     while retry < threshold:
         qres = requests.get(url, headers=header, params=params)
+        mfg.set(org_name, 'status', 'querying for logs')
             
         ''' sample error:
             RuntimeError: errorCode='INVALID_SESSION_ID': message='Session expired or invalid'
@@ -932,6 +941,9 @@ def run_log_collect(org_name, login, days):
     # check monitor file
     errors = []
     for record in log_list:
+        # update mfg
+        mfg.set(org_name, 'record', '%s.%s' % (str(record['type']), str(record['date'])))
+
         # process the record and returns set of error strings
         errors += process_record(org_name, record, header)
 
@@ -940,6 +952,9 @@ def run_log_collect(org_name, login, days):
     # shoot a summary email of errors for this org
     if errors:
         log.error('Summary:\n\tErrors found for org: %s\n' % org_name + '\n'.join(map(str, errors)))
+
+        # update mfg
+        mfg.set(org_name, 'errors', '%s' % ('|'.join(map(str, errors))))
 
     timer_finish = datetime.now()
     d = timer_finish - timer_start
@@ -1060,6 +1075,7 @@ def main (argv):
                     if org_temp:
                         org_list[s] = org_temp 
                         extract_configs(rest, s, args.app)
+
         # specify only one org to extract from
         else:
             try:
@@ -1101,6 +1117,10 @@ def main (argv):
         
         for o in org_collect:            
             run_log_collect(org_name=o, login=login, days=days)
+
+            time_org = final_time.strftime('%m/%d/%Y %H:%M:%S.%f')
+            mfg.set(s, 'last_run', time_org)
+            log.debug('marking org %s run at: %s' % (o, time_org))
 
     except Exception, e:
         log.error(repr(e),exc_info=1)
