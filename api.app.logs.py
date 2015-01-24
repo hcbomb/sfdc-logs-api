@@ -745,6 +745,7 @@ def process_record(org_name, record, header):
     with open(dest_filename, 'wb') as f:
         # for chunk in req.iter_content(chunk_size=2024):
         for line in req.iter_lines(chunk_size=2048):
+          try:
             if line:
                 try:    # for thread synchronization
                     sh.acquire()
@@ -765,6 +766,10 @@ def process_record(org_name, record, header):
                         f.flush()
                 finally:
                     sh.release()
+          # skip                    
+          except requests.exceptions.ChunkedEncodingError, cherr:
+            errors.append('chunked encoding error. skipping line. %r' % repr(cherr))
+            continue
 
     timer_finish = datetime.now()
     d = timer_finish - timer_start
@@ -1121,7 +1126,7 @@ def main (argv):
             final_time = datetime.now()
 
             time_org = final_time.strftime('%m/%d/%Y %H:%M:%S.%f')
-            mfg.set(s, 'last_run', time_org)
+            mfg.set(o, 'last_run', time_org)
             log.debug('marking org %s run at: %s' % (o, time_org))
 
     except Exception, e:
